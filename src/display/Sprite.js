@@ -1,8 +1,7 @@
 var EventEmitter = require('../utils/EventEmitter'),
-    Rectangle = require('../math/Rectangle'),
-    Body = require('../physics/Body'),
     inherit = require('../utils/inherit'),
     Texture = require('./Texture'),
+    PhysicsTarget = require('../physics/PhysicsTarget'),
     math = require('../math/math'),
     utils = require('../utils/utils'),
     PIXI = require('../vendor/pixi');
@@ -126,10 +125,6 @@ var Sprite = module.exports = function(anims, speed, start) {
      * @readOnly
      */
     this.playing = false;
-
-    this.hitArea = this.hitArea || new Rectangle(0, 0, this.width, this.height);
-
-    this.body = new Body(this);
 
     //start playing
     this.goto(0, this.currentAnimation).play();
@@ -263,10 +258,7 @@ inherit(Sprite, PIXI.Sprite, {
     destroy: function() {
         this.stop();
 
-        if(this._physics) {
-            this._physics.removeSprite(this);
-            this._physics = null;
-        }
+        this.disablePhysics();
 
         if(this.parent)
             this.parent.removeChild(this);
@@ -316,6 +308,7 @@ inherit(Sprite, PIXI.Sprite, {
         }
     }
 });
+PhysicsTarget.call(Sprite.prototype);
 
 //Add event echos
 /*

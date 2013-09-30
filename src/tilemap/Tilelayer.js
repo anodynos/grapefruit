@@ -6,8 +6,7 @@ var Container = require('../display/Container'),
     math = require('../math/math'),
     utils = require('../utils/utils'),
     inherit = require('../utils/inherit'),
-    support = require('../utils/support'),
-    C = require('../constants');
+    support = require('../utils/support');
 
 /**
  * The Tilelayer is the visual tiled layer that actually displays on the screen
@@ -287,7 +286,7 @@ inherit(Tilelayer, Container, {
      */
     clearTile: function(tile, remove) {
         tile.visible = false;
-        this.state.physics.removeSprite(tile);
+        tile.disablePhysics();
 
         if(remove)
             this.removeChild(tile);
@@ -346,7 +345,7 @@ inherit(Tilelayer, Container, {
         if(this.tiles[fromTileX] && this.tiles[fromTileX][fromTileY]) {
             tile = this.tiles[fromTileX][fromTileY];
             this.tiles[fromTileX][fromTileY] = null;
-            this.state.physics.removeSprite(tile);
+            tile.disablePhysics();
         }
         //otherwise grab a new tile from the pool
         else {
@@ -357,7 +356,7 @@ inherit(Tilelayer, Container, {
         //then create a new tile
         if(!tile) {
             tile = new Tile(texture);
-            tile.mass = props.mass;
+            tile.mass = props.mass || Infinity;
             tile.anchor.y = 1;
             this.addChild(tile);
         }
@@ -372,8 +371,7 @@ inherit(Tilelayer, Container, {
         tile.position.y = position[1];
 
         if(props.mass) {
-            tile.body.type = C.PHYSICS_TYPE.STATIC;
-            this.state.physics.addSprite(tile);
+            tile.enablePhysics(this.state.physics);
         }
 
         //pass through all events
@@ -475,7 +473,7 @@ inherit(Tilelayer, Container, {
         }
 
         if(this.hasPhysics) {
-            this.parent.parent.physics.reindexStatic();
+            this.state.physics.reindexStatic();
         }
     },
     _renderLeft: function(forceNew) {

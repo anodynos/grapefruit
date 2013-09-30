@@ -50,7 +50,7 @@ inherit(ObjectFactory, Object, {
 
         //if undefined, then default to true
         if(physics || physics === undefined) {
-            this.state.physics.addSprite(spr);
+            spr.enablePhysics(this.state.physics);
         }
 
         return this.parent.addChild(spr);

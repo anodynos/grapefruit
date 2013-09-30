@@ -1,395 +1,415 @@
-// Based heavily off of PhotonStorm's Phaser Arcade Physics, and ChipmunkJS (mostly the former)
-// Phaser: https://github.com/photonstorm/phaser 
-// ChipmunkJS: https://github.com/josephg/Chipmunk-js
-
-var QuadTree = require('../math/QuadTree'),
-    Container = require('../display/Container'),
-    Sprite = require('../display/Sprite'),
+var Rectangle = require('../math/Rectangle'),
+    Circle = require('../math/Circle'),
+    Polygon = require('../math/Polygon'),
     Vector = require('../math/Vector'),
+    Tile = require('../tilemap/Tile'),
     inherit = require('../utils/inherit'),
-    math = require('../math/math'),
-    C = require('../constants');
+    cp = require('../vendor/cp');
 
 var Physics = module.exports = function(state) {
+    /**
+     * The state this system belongs to
+     *
+     * @property state
+     * @type Game
+     */
     this.state = state;
 
-    /**
-     * The maximum objects the quad tree will tolerate in a single quadrant
-     *
-     * @property maxObjects
-     * @type Number
-     */
-    this.maxObjects = C.PHYSICS.MAX_QUAD_OBJECTS;
+    this.space = new cp.Space();
+    this.space.gravity = new Vector(0, 987);
 
-    /**
-     * The maximum levels deep the quad tree will go to
-     *
-     * @property maxLevels
-     * @type Number
-     */
-    this.maxLevels = C.PHYSICS.MAX_QUAD_LEVELS;
+    //Time a body must remain idle to fall asleep
+    //see: http://chipmunk-physics.net/release/ChipmunkLatest-API-Reference/structcp_space.html#a928d74741904aae266a9efff5b5f68f7
+    this.space.sleepTimeThreshold = 0.2;
 
-    /**
-     * The QuadTree used to help detect likely collisions
-     *
-     * @property tree
-     * @type QuadTree
-     */
-    this.tree = new QuadTree(state.world.bounds.clone(), this.maxObjects, this.maxLevels);
+    //Amount of encouraged penetration between colliding shapes.
+    //see: http://chipmunk-physics.net/release/ChipmunkLatest-API-Reference/structcp_space.html#af1bec644a24e12bfc642a942a88520f7
+    this.space.collisionSlop = 0.1;
 
-    /**
-     * The bodies that have been added to this physics system
-     *
-     * @property tree
-     * @type QuadTree
-     */
-    this.bodies = [];
+    //These two collision scenarios are separate because we don't
+    //want tiles to collide with tiles all the time
 
-    /**
-     * The gravity that the system will simulate
-     *
-     * @property gravity
-     * @type Vector
-     */
-    this.gravity = new Vector(0, 9.87);
+    //sprite - sprite collisions
+    this.space.addCollisionHandler(
+        Physics.COLLIDER.SPRITE,
+        Physics.COLLIDER.SPRITE,
+        this.onCollisionBegin.bind(this), //begin
+        null, //preSolve
+        this.onCollisionPostSolve.bind(this), //postSolve
+        this.onCollisionEnd.bind(this) //separate
+    );
 
-    //some temp vars to prevent have to declare a lot
-    this._total = 0;
-    this._overlap = 0;
-    this._maxOverlap = 0;
+    //sprite - tile collisions
+    this.space.addCollisionHandler(
+        Physics.COLLIDER.SPRITE,
+        Physics.COLLIDER.TILE,
+        this.onCollisionBegin.bind(this), //begin
+        null, //preSolve
+        this.onCollisionPostSolve.bind(this), //postSolve
+        this.onCollisionEnd.bind(this) //separate
+    );
 
-    this._velocity1 = 0;
-    this._velocity2 = 0;
-    this._newVelocity1 = 0;
-    this._newVelocity2 = 0;
+    this.actionQueue = [];
+    this.tickCallbacks = [];
+    this._skip = 0;
 
-    this._average = 0;
-    this._potentials = null;
+    this._offset = new Vector();
 };
 
 inherit(Physics, Object, {
-    /**
-     * Called each frame by the engine to calculate the quadtree, and update physical bodies
-     *
-     * @method update
-     * @param deltaTime {Number} The delta in seconds since the last call
-     */
+    _createBody: function(spr) {
+        var body = new cp.Body(
+            spr.mass || 1,
+            spr.inertia || cp.momentForBox(spr.mass || 1, spr.width, spr.height) || Infinity
+        );
+
+        if(spr.mass === Infinity) {
+            //inifinite mass means it is static, so make it static
+            //and do not add it to the world (no need to simulate it)
+            body.nodeIdleTime = Infinity;
+        }// else {
+            //this.space.addBody(body);
+        //}
+
+        return body;
+    },
+    _createShape: function(spr, body, poly) {
+        var shape,
+            hit = poly || spr.hitArea,
+            ax = spr.anchor ? spr.anchor.x : 0,
+            ay = spr.anchor ? spr.anchor.y : 0,
+            aw = spr.width * ax,
+            ah = spr.height * ay;
+
+        if(!hit) {
+            hit = new Rectangle(
+                0,
+                0,
+                spr.width,
+                spr.height
+            );
+        }
+
+        //specified shape
+        if(hit instanceof Rectangle) {
+            //convert the top-left anchored rectangle to left,right,bottom,top values
+            //for chipmunk space that will corospond to our own
+            var l = hit.x,
+                r = hit.x + hit.width,
+                b = hit.y - spr.height,
+                t = b + hit.height;
+
+            l -= aw;
+            r -= aw;
+
+            b += spr.height - ah;
+            t += spr.height - ah;
+
+            shape = new cp.BoxShape2(body, new cp.BB(l, b, r, t));
+        }
+        else if(hit instanceof Circle) {
+            //the offset needs to move the circle to the sprite center based on the sprite's anchor (bottom-left)
+            var offset = new Vector(
+                ((spr.width / 2) - aw) + hit.x,
+                ((spr.height / 2) - ah) + hit.y
+            );
+
+            shape = new cp.CircleShape(body, hit.radius, offset);
+        }
+        else if(hit instanceof Polygon) {
+            //cp shapes anchors are 0.5,0.5, but a polygon uses 0,0 as the topleft
+            //of the bounding rect so we have to convert
+            var points = [],
+                ps = hit.points;
+
+            for(var i = 0; i < ps.length; ++i) {
+                var p = ps[i];
+
+                points.push(p.x - aw);
+                points.push(p.y - ah);
+            }
+
+            shape = new cp.PolyShape(body, cp.convexHull(points, null, 0), cp.vzero);
+        }
+
+        //this.space.addShape(shape);
+
+        shape.width = spr.width;
+        shape.height = spr.height;
+        shape.sprite = spr;
+        shape.setElasticity(spr.bounce || 0);
+        shape.setSensor(spr.sensor);
+        shape.setCollisionType(this.getCollisionType(spr));
+        shape.setFriction(spr.friction || 0);
+
+        return shape;
+    },
+    nextTick: function(fn) {
+        this.tickCallbacks.push(fn);
+    },
+    reindexStatic: function() {
+        this.actionQueue.push(['reindexStatic']);
+        this.act();
+    },
+    getCollisionType: function(spr) {
+        if(spr instanceof Tile) {
+            return Physics.COLLIDER.TILE;
+        } else {
+            return Physics.COLLIDER.SPRITE;
+        }
+    },
+    add: function(spr) {
+        //already in system
+        if(spr._phys && spr._phys.body)
+            return;
+
+        var body = this._createBody(spr),
+            shape = this._createShape(spr, body)/*,
+            control*/;
+
+        //add control body and constraints
+        /*if(!body.isStatic()) {
+            var cbody = new cp.Body(Infinity, Infinity), //control body
+                cpivot = new cp.PivotJoint(cbody, body, cp.vzero, cp.vzero),
+                cgear = new cp.GearJoint(cbody, body, 0, 1);
+
+            cpivot.maxBias = 0; //disable join correction
+            cpivot.maxForce = 10000; //emulate linear friction
+
+            cgear.errorBias = 0; //attempt to fully correct the joint each step
+            cgear.maxBias = 1.2; //but limit the angular correction
+            cgear.maxForce = 50000; //emulate angular friction
+
+            control = {};
+            control.body = cbody;
+            control.pivot = cpivot;
+            control.gear = cgear;
+        }*/
+
+        this.actionQueue.push(['add', {
+            spr: spr,
+            body: body,
+            shape: shape/*,
+            control: control*/
+        }]);
+        this.act();
+    },
+    remove: function(spr) {
+        if(!spr || !spr._phys || !spr._phys.body || !spr._phys.shape)
+            return;
+
+        this.actionQueue.push(['remove', spr._phys]);
+        this.act();
+    },
+    reindex: function(spr) {
+        if(!spr || !spr._phys || !spr._phys.shape)
+            return;
+
+        this.actionQueue.push(['reindex', spr._phys.shape]);
+        this.act();
+    },
+    addCustomShape: function(spr, poly, sensor) {
+        if(spr && spr._phys && spr._phys.body) {
+            var s = this._createShape(spr, spr._phys.body, poly);
+
+            s.setSensor(sensor);
+            s.width = spr.width;
+            s.height = spr.height;
+            s.sprite = spr;
+            s.setElasticity(0);
+            s.setSensor(sensor !== undefined ? sensor : spr.sensor);
+            s.setCollisionType(this.getCollisionType(spr));
+            s.setFriction(spr.friction || 0);
+
+            this.actionQueue.push(['addCustomShape', { spr: spr, shape: s }]);
+            this.act();
+
+            return s;
+        }
+    },
+    setMass: function(spr, mass) {
+        if(spr && spr._phys && spr._phys.body)
+            spr._phys.body.setMass(mass);
+    },
+    setVelocity: function(spr, vel) {
+        //update control body velocity (and pivot contraint makes regular follow)
+        //if(spr && spr._phys && spr._phys.control && spr._phys.control.body)
+        //    spr._phys.control.body.setVel(vel);
+
+        //if no control body then update real body
+        //else 
+        if(spr && spr._phys && spr._phys.body)
+            spr._phys.body.setVel(vel);
+    },
+    setPosition: function(spr, pos) {
+        //update body position
+        if(spr && spr._phys && spr._phys.body)
+            spr._phys.body.setPos(pos);
+
+        //update control body position
+        //if(spr && spr._phys && spr._phys.control && spr._phys.control.body)
+        //    spr._phys.control.body.setPos(pos);
+    },
+    setRotation: function(spr, rads) {
+        //update control body rotation (and gear contraint makes regular follow)
+        //if(spr && spr._phys && spr._phys.control && spr._phys.control.body)
+        //    spr._phys.control.body.setAngle(rads);
+
+        //if no control body then update real body
+        //else
+        if(spr && spr._phys && spr._phys.body)
+            spr._phys.body.setAngle(rads);
+
+    },
     update: function(dt) {
-        //clear quad tree
-        this.tree.clear();
+        if(this._paused)
+            return;
 
-        //update bodies
-        var bods = this.bodies;
+        while(this.tickCallbacks.length)
+            (this.tickCallbacks.shift()).call(this);
 
-        for(var i = 0, il = bods.length, body; i < il; ++i) {
-            body = bods[i];
+        if(this._skip)
+            return this._skip--;
 
-            body.update(dt, this.gravity);
+        //execute the physics step
+        this.space.step(dt);
 
-            if(body.allowCollide && body.sprite.visible) {
-                this.tree.insert(body);
-            }
-        }
+        //go through each changed shape
+        this.space.activeShapes.each(function(shape) {
+            //since the anchor for a cp shape is 0.5 0.5, we have to modify the pos a bit
+            //to make it match the sprite's anchor point
+            var spr = shape.sprite;
+            spr.position.x = shape.body.p.x;// + ((spr.anchor.x * shape.width) - (shape.width / 2));
+            spr.position.y = shape.body.p.y;// + ((spr.anchor.y * shape.height) - (shape.height / 2));
+            spr.rotation = shape.body.a;
+
+            spr.emit('physUpdate');
+        });
     },
-    /**
-     * Adds a sprite to the physics simulation
-     *
-     * @method addSprite
-     * @param sprite {Sprite} The sprite to add to the simulation
-     */
-    addSprite: function(sprite) {
-        this.bodies.push(sprite.body);
-        sprite._physics = this;
-    },
-    /**
-     * Removes a sprite from the physics simulation
-     *
-     * @method removeSprite
-     * @param sprite {Sprite} The sprite to remove from the simulation
-     */
-    removeSprite: function(sprite) {
-        var i = this.bodies.indexOf(sprite.body);
+    onCollisionBegin: function(arbiter) {//, space) {
+        var shapes = arbiter.getShapes(),
+            spr1 = shapes[0].sprite,
+            spr2 = shapes[1].sprite;
 
-        if(i !== -1)
-            this.bodies.splice(i, 1);
-    },
-    /**
-     * Checks for collisions between objects such as Sprites or Containers.
-     *
-     * @method collide
-     * @param object1 {Sprite|Container} The first object to check
-     * @param object2 {Sprite|Container} The first object to check
-     * @param onCollision {Function} The callback to call whenever a collision occurs
-     */
-    collide: function(obj1, obj2, onCollision) {
-        this._total = 0;
-
-        if(obj1 && obj2) {
-            //sprite collisions
-            if(obj1 instanceof Sprite) {
-                if(obj2 instanceof Sprite) {
-                    this._collideSpriteVsSprite(obj1, obj2, onCollision);
-                }
-                else if(obj2 instanceof Container) {
-                    this._collideSpriteVsContainer(obj1, obj2, onCollision);
-                }
-            }
-            //container collisions
-            else if(obj1 instanceof Container) {
-                if(obj2 instanceof Sprite) {
-                    this._collideSpriteVsContainer(obj2, obj1, onCollision);
-                }
-                else if(obj2 instanceof Container) {
-                    this._collideContainerVsContainer(obj1, obj2, onCollision);
-                }
-            }
+        //only call the sensor collisions here
+        if(shapes[0].sensor || shapes[1].sensor) {
+            spr1.onCollision(spr2, arbiter.getNormal(0), shapes[1], shapes[0]);
+            spr2.onCollision(spr1, arbiter.getNormal(0), shapes[0], shapes[1]);
         }
 
-        return this._total;
+        //maintain the colliding state
+        return true;
     },
-    /**
-     * The core separation function to separate two physics bodies.
-     *
-     * @method separate
-     * @param body1 {Body} The first Body to separate
-     * @param body2 {Body} The second Body to separate
-     * @returns {Boolean} Returns true if the bodies were separated, otherwise false.
-     */
-    separate: function(b1, b2) {
-        //make sure the sprite is updated after the collision solve
-        if(this._separateX(b1, b2) || this._separateY(b1, b2)) {
-            b1.syncSprite();
-            b2.syncSprite();
+    onCollisionPostSolve: function(arbiter) {//, space) {
+        var shapes = arbiter.getShapes(),
+            spr1 = shapes[0].sprite,
+            spr2 = shapes[1].sprite;
 
-            return true;
+        if(arbiter.isFirstContact()) {
+            spr1.onCollision(spr2, arbiter.totalImpulse(), shapes[1], shapes[0]);
+            spr2.onCollision(spr1, arbiter.totalImpulse(), shapes[0], shapes[1]);
         }
 
-        return false;
+        //maintain the colliding state
+        return true;
     },
-    _hit: function(obj1, obj2, cb) {
-        this._total++;
+    onCollisionEnd: function(arbiter) {//, space) {
+        var shapes = arbiter.getShapes(),
+            spr1 = shapes[0].sprite,
+            spr2 = shapes[1].sprite;
 
-        if(cb)
-            cb(obj1, obj2);
+        spr1.onSeparate(spr2, shapes[1], shapes[0]);
+        spr2.onSeparate(spr1, shapes[0], shapes[1]);
+
+        //maintain the colliding state
+        return true;
     },
-    _separateX: function(b1, b2) {
-        //static bodies don't collide with eachother
-        if(b1.type === C.PHYSICS_TYPE.STATIC && b2.type === C.PHYSICS_TYPE.STATIC)
-            return false;
-
-        //delta of the two body locations
-        this._overlap = 0;
-
-        var dx1 = b1.deltaX(),
-            dx2 = b2.deltaX();
-
-        //check for overlap (detect collisions)
-        if(b1.overlaps(b2)) {
-            this._maxOverlap = math.abs(dx1) + math.abs(dx2) + C.PHYSICS.OVERLAP_BIAS;
-
-            //the overlap but neither are moving
-            if(dx1 === 0 && dx2 === 0) {
-                b1.embedded = true;
-                b2.embedded = true;
-            }
-            //if they did overlap to the right
-            else if(dx1 > dx2) {
-                this._overlap = b1.right - b2.x;
-
-                //check collision flags, if touching set such
-                if((this._overlap > this._maxOverlap) || !(b1.allowCollide & C.DIRECTION.RIGHT) || !(b2.allowCollide & C.DIRECTION.LEFT)) {
-                    this._overlap = 0;
-                } else {
-                    b1.touching |= C.DIRECTION.RIGHT;
-                    b2.touching |= C.DIRECTION.LEFT;
-                }
-            }
-            //if they did overlap to the left
-            else if(dx1 < dx2) {
-                this._overlap = b1.x - b2.width - b2.x;
-
-                if((-this._overlap > this._maxOverlap) || !(b1.allowCollide & C.DIRECTION.LEFT) || !(b2.allowCollide & C.DIRECTION.RIGHT)) {
-                    this._overlap = 0;
-                } else {
-                    b1.touching |= C.DIRECTION.LEFT;
-                    b2.touching |= C.DIRECTION.RIGHT;
-                }
-            }
-        }
-
-        //adjust positions and velocity according to collisions (solve collisions)
-        if(this._overlap) {
-            b1.overlap.x = b2.overlap.x = this._overlap;
-
-            //set velocities
-            this._velocity1 = b1.velocity.x;
-            this._velocity2 = b2.velocity.x;
-
-            //static entities do not move
-            if(b1.type !== C.PHYSICS_TYPE.STATIC && b2.type !== C.PHYSICS_TYPE.STATIC) {
-                this._overlap *= 0.5;
-
-                b1.x = b1.x - this._overlap;
-                b2.x += this._overlap;
-
-                this._newVelocity1 = math.sqrt((this._velocity2 * this._velocity2 * b2.mass) / b1.mass) * ((this._velocity2 > 0) ? 1 : -1);
-                this._newVelocity2 = math.sqrt((this._velocity1 * this._velocity1 * b1.mass) / b2.mass) * ((this._velocity1 > 0) ? 1 : -1);
-                this._average = (this._newVelocity1 + this._newVelocity2) * 0.5;
-                this._newVelocity1 -= this._average;
-                this._newVelocity2 -= this._average;
-
-                b1.velocity.x = this._average + (this._newVelocity1 * b1.bounce.x);
-                b2.velocity.x = this._average + (this._newVelocity2 * b1.bounce.x);
-            }
-            //if body 1 isn't static
-            else if(b1.type !== C.PHYSICS_TYPE.STATIC) {
-                b1.x -= this._overlap;
-                b1.velocity.x = this._velocity2 - (this._velocity1 * b1.bounce.x);
-            }
-            //if body 2 isn't static
-            else if(b2.type !== C.PHYSICS_TYPE.STATIC) {
-                b2.x += this._overlap;
-                b2.velocity.x = this._velocity1 - (this._velocity2 * b2.bounce.x);
-            }
-
-            return true;
-        }
-
-        return false;
-    },
-    _separateY: function(b1, b2) {
-        //static bodies don't collide with eachother
-        if(b1.type === C.PHYSICS_TYPE.STATIC && b2.type === C.PHYSICS_TYPE.STATIC)
-            return false;
-
-        //delta of the two body locations
-        this._overlap = 0;
-
-        var dy1 = b1.deltaY(),
-            dy2 = b2.deltaY();
-
-        //check for overlap (detect collisions)
-        if(b1.overlaps(b2)) {
-            this._maxOverlap = math.abs(dy1) + math.abs(dy2) + C.PHYSICS.OVERLAP_BIAS;
-
-            //they overlap but neither are moving
-            if(dy1 === 0 && dy2 === 0) {
-                b1.embedded = true;
-                b2.embedded = true;
-            }
-            //if they did overlap down
-            else if(dy1 > dy2) {
-                this._overlap = b1.bottom - b2.y;
-
-                //check collision flags, if touching set such
-                if((this._overlap > this._maxOverlap) || !(b1.allowCollide & C.DIRECTION.BOTTOM) || !(b2.allowCollide & C.DIRECTION.TOP)) {
-                    this._overlap = 0;
-                } else {
-                    b1.touching |= C.DIRECTION.BOTTOM;
-                    b2.touching |= C.DIRECTION.TOP;
-                }
-            }
-            //if they did overlap up
-            else if(dy1 < dy2) {
-                this._overlap = b1.y - b2.height - b2.y;
-
-                if((-this._overlap > this._maxOverlap) || !(b1.allowCollide & C.DIRECTION.TOP) || !(b2.allowCollide & C.DIRECTION.BOTTOM)) {
-                    this._overlap = 0;
-                } else {
-                    b1.touching |= C.DIRECTION.TOP;
-                    b2.touching |= C.DIRECTION.BOTTOM;
-                }
-            }
-        }
-
-        //adjust positions and velocity according to collisions (solve collisions)
-        if(this._overlap) {
-            b1.overlap.y = b2.overlap.y = this._overlap;
-
-            //set velocities
-            this._velocity1 = b1.velocity.y;
-            this._velocity2 = b2.velocity.y;
-
-            //static entities do not move
-            if(b1.type !== C.PHYSICS_TYPE.STATIC && b2.type !== C.PHYSICS_TYPE.STATIC) {
-                this._overlap *= 0.5;
-
-                b1.y = b1.y - this._overlap;
-                b2.y += this._overlap;
-
-                this._newVelocity1 = math.sqrt((this._velocity2 * this._velocity2 * b2.mass) / b1.mass) * ((this._velocity2 > 0) ? 1 : -1);
-                this._newVelocity2 = math.sqrt((this._velocity1 * this._velocity1 * b1.mass) / b2.mass) * ((this._velocity1 > 0) ? 1 : -1);
-                this._average = (this._newVelocity1 + this._newVelocity2) * 0.5;
-                this._newVelocity1 -= this._average;
-                this._newVelocity2 -= this._average;
-
-                b1.velocity.y = this._average + (this._newVelocity1 * b1.bounce.y);
-                b2.velocity.y = this._average + (this._newVelocity2 * b1.bounce.y);
-            }
-            //if body 1 isn't static
-            else if(b1.type !== C.PHYSICS_TYPE.STATIC) {
-                b1.y -= this._overlap;
-                b1.velocity.y = this._velocity2 - (this._velocity1 * b1.bounce.y);
-
-                //special case for things like being on a moving platform
-                if(b2.carry && dy1 > dy2) {
-                    b1.x += b2.deltaX();
-                }
-            }
-            //if body 2 isn't static
-            else if(b2.type !== C.PHYSICS_TYPE.STATIC) {
-                b2.y += this._overlap;
-                b2.velocity.y = this._velocity1 - (this._velocity2 * b2.bounce.y);
-
-                //special case for things like being on a moving platform
-                if(b1.carry && dy1 < dy2) {
-                    b2.x += b1.deltaX();
-                }
-            }
-
-            return true;
-        }
-
-        return false;
-    },
-    _collideSpriteVsSprite: function(sprite1, sprite2, onCollision) {
-        if(this.separate(sprite1.body, sprite2.body)) {
-            this._hit(sprite1, sprite2, onCollision);
+    act: function() {
+        if(this.space.locked) {
+            this.space.addPostStepCallback(this.onPostStep.bind(this));
+        } else {
+            this.onPostStep();
         }
     },
-    _collideSpriteVsContainer: function(sprite, container, onCollision) {
-        this._potentials = this.tree.retrieve(sprite.body);
+    pause: function() {
+        this._paused = true;
+    },
+    resume: function() {
+        this._paused = false;
+    },
+    skip: function(num) {
+        this._skip = num;
+    },
+    skipNext: function() {
+        this.skip(1);
+    },
+    onPostStep: function() {
+        //remove items
+        while(this.actionQueue.length) {
+            var a = this.actionQueue.shift(),
+                act = a[0],
+                data = a[1];
 
-        for(var i = 0, il = this._potentials.length; i < il; ++i) {
-            if(this._spriteInChain(this._potentials[i].sprite, container)) {
-                if(this.separate(sprite.body, this._potentials[i])) {
-                    this._hit(sprite, container, onCollision);
-                }
+            switch(act) {
+                case 'add':
+                    data.body.setPos(data.spr.position);
+                    if(!data.body.isStatic()) {
+                        this.space.addBody(data.body);
+                    }
+
+                    this.space.addShape(data.shape);
+
+                    /*if(data.control) {
+                        data.control.body.setPos(data.spr.position);
+                        this.space.addConstraint(data.control.pivot);
+                        this.space.addConstraint(data.control.gear);
+                    }*/
+
+                    data.spr._phys = data;
+                    break;
+
+                case 'remove':
+                    if(data.body.space)
+                        this.space.removeBody(data.body);
+
+                    if(data.shape.space)
+                        this.space.removeShape(data.shape);
+
+                    if(data.customShapes) {
+                        for(var i = data.customShapes.length - 1; i > -1; --i) {
+                            this.space.removeShape(data.customShapes[i]);
+                        }
+                    }
+
+                    //remove references
+                    data.body = null;
+                    data.shape.sprite = null;
+                    data.shape = null;
+                    data.customShapes = null;
+                    break;
+
+                case 'reindex':
+                    this.space.reindexShape(data);
+                    break;
+
+                case 'reindexStatic':
+                    this.space.reindexStatic();
+                    break;
+
+                case 'addCustomShape':
+                    if(!data.spr._phys.customShapes)
+                        data.spr._phys.customShapes = [];
+
+                    data.spr._phys.customShapes.push(data.shape);
+                    this.space.addShape(data.shape);
+                    break;
+
             }
         }
-    },
-    _collideContainerVsContainer: function(container1, container2, onCollision) {
-        if(container1.first._iNext) {
-            var node = container1.first._iNext;
-
-            do {
-                if(node instanceof Sprite)
-                    this.collideSpriteVsGroup(node, container2, onCollision);
-
-                node = node._iNext;
-            } while (node !== container1.last._iNext);
-        }
-    },
-    _spriteInChain: function(spr, container) {
-        var c = spr._container;
-
-        while(c) {
-            if(c === container)
-                return true;
-
-            c = c.parent;
-        }
-
-        return false;
     }
 });
+
+Physics.COLLIDER = {
+    SPRITE: 0,
+    TILE: 1
+};

@@ -90,7 +90,8 @@ inherit(ObjectGroup, Container, {
      * @return {ObjectGroup} Returns itself for chainability
      */
     spawn: function() {
-        var game = this.game; //this.Tilemap.GameState.Game
+        var state = this.state,
+            game = this.game;
 
         //we go through these backwards so that things that are higher in the
         //list of object gets rendered on top.
@@ -157,7 +158,7 @@ inherit(ObjectGroup, Container, {
 
                 //these are treated as sensor bodies, so always enable physics
                 obj.setPosition(o.x, o.y);
-                obj.enablePhysics(game.physics);
+                obj.enablePhysics(state.physics);
                 if(this.parent._showPhysics)
                     obj.showPhysics();
             } else {
@@ -184,7 +185,7 @@ inherit(ObjectGroup, Container, {
                 obj.anchor.x = a ? a[0] : (this.parent.orientation === 'isometric' ? 0.5 : 0);
 
                 if(props.mass || props.tileprops.mass) {
-                    obj.enablePhysics(game.physics);
+                    obj.enablePhysics(state.physics);
 
                     if(this.parent._showPhysics)
                         obj.showPhysics();

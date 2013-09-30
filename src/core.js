@@ -99,8 +99,8 @@ module.exports = {
     ParticleSystem:     require('./particles/ParticleSystem'),
 
     //physics
-    Physics:    require('./physics/Physics'),
-    Body:       require('./physics/Body'),
+    Physics:        require('./physics/Physics'),
+    PhysicsTarget:  require('./physics/PhysicsTarget'),
 
     //utils
     utils:          require('./utils/utils'),
